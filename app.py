@@ -591,12 +591,12 @@ def render_ultrasound_results(result: dict) -> None:
     cols[0].image(
         result["original_image"],
         caption="Input image (resized 224×224)",
-        use_container_width=True,
+        width="stretch",
     )
     cols[1].image(
         result["gradcam_overlay"],
         caption="Grad-CAM overlay at final conv block",
-        use_container_width=True,
+        width="stretch",
     )
 
 
