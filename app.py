@@ -34,25 +34,31 @@ PREPROCESS_PATH = MODELS_DIR / "preprocessor.pkl"
 # Module B artefacts
 DENSENET_PATH = MODELS_DIR / "densenet121_final.pt"
 
-# Tabular feature schema (must match training)
-NUMERIC_FEATURES = [
+CATEGORICAL_FEATURES = ["sex", "blood_group"]
+
+BINARY_FEATURES = ["hiv", "vdrl", "tpha"]
+
+# Numeric features expected by the preprocessor, in the exact order the
+# notebook's NUMERIC_FEATURES list uses. The last three (ast_alt_ratio,
+# apri, fib4) are derived from AST, ALT, age, and platelets and are
+# computed on the fly in predict_tabular(); the user does not enter them.
+NUMERIC_FEATURES_USER = [
     "age",
-    "alt",
-    "ast",
-    "alp",
-    "platelets",
-    "total_bilirubin",
-    "direct_bilirubin",
-    "albumin",
     "haemoglobin",
+    "rbs",
+    "creatinine",
+    "ast",
+    "alt",
+    "platelets",
     "wbc",
     "rbc",
+    "alp",
     "bun",
-    "creatinine",
-    "fasting_glucose",
 ]
+NUMERIC_FEATURES_DERIVED = ["ast_alt_ratio", "apri", "fib4"]
+NUMERIC_FEATURES = NUMERIC_FEATURES_USER + NUMERIC_FEATURES_DERIVED
 
-CATEGORICAL_FEATURES = ["sex"]
+BLOOD_GROUPS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
 
 METAVIR_STAGES = {
     0: "F0 (no fibrosis)",
@@ -148,52 +154,78 @@ def load_module_a():
     return artefacts
 
 
+def _compute_derived_features(rec: dict) -> dict:
+    """Compute the three derived numeric features from raw lab values."""
+    ast = float(rec.get("ast", 0.0))
+    alt = float(rec.get("alt", 0.0))
+    age = float(rec.get("age", 0.0))
+    plt = float(rec.get("platelets", 0.0))
+
+    ast_alt_ratio = (ast / alt) if alt > 0 else 0.0
+    apri = ((ast / 40.0) * (100.0 / plt) * 100.0) if plt > 0 else 0.0
+    fib4 = ((age * ast) / (plt * (alt**0.5))) if (plt > 0 and alt > 0) else 0.0
+
+    return {
+        "ast_alt_ratio": ast_alt_ratio,
+        "apri": apri,
+        "fib4": fib4,
+    }
+
+
 def predict_tabular(input_record: dict, artefacts: dict) -> dict:
     """Run tabular inference. Returns dict with hbv_prob, hcv_prob,
     feature_vector (for SHAP), and shap_values."""
     import shap
 
-    # Build a single-row DataFrame matching the training schema
-    row = pd.DataFrame([input_record])
+    # Build a single-row DataFrame matching the training schema exactly.
+    # The preprocessor expects 19 columns: 14 numeric + 3 binary + 2 cat.
+    full_record = dict(input_record)
+    full_record.update(_compute_derived_features(input_record))
 
-    # Derived features
-    if "ast" in input_record and "platelets" in input_record:
-        row["apri"] = (
-            (input_record["ast"] / 40.0)
-            * (100.0 / max(input_record["platelets"], 1))
-            * 100.0
-        )
-    if all(k in input_record for k in ("age", "ast", "alt", "platelets")):
-        row["fib4"] = (input_record["age"] * input_record["ast"]) / (
-            max(input_record["platelets"], 1) * (input_record["alt"] ** 0.5)
-        )
+    expected_cols = NUMERIC_FEATURES + BINARY_FEATURES + CATEGORICAL_FEATURES
+    row = pd.DataFrame([{col: full_record.get(col) for col in expected_cols}])
 
     # Preprocess
     X = artefacts["preprocessor"].transform(row)
+    # ColumnTransformer may return a DataFrame depending on set_output config
+    X_arr = X.values if hasattr(X, "values") else X
 
     # Calibrated HBV probability
-    hbv_prob = float(artefacts["hbv_calibrated"].predict_proba(X)[0, 1])
+    hbv_prob = float(artefacts["hbv_calibrated"].predict_proba(X_arr)[0, 1])
 
-    # HCV probability from the RF (HCV had no separate calibration step in
-    # the thesis because the null finding precluded a deployable calibrator)
-    hcv_prob = float(artefacts["hcv_rf"].predict_proba(X)[0, 1])
+    # HCV probability from the grid winner (RF in the thesis); reported with
+    # a low-confidence caveat in the UI because the thesis frames the HCV
+    # result as a data-sufficiency null finding.
+    hcv_prob = float(artefacts["hcv_rf"].predict_proba(X_arr)[0, 1])
 
-    # SHAP attribution on the random forest (Tree SHAP exact)
+    # SHAP attribution on the HBV random forest (Tree SHAP exact).
     explainer = shap.TreeExplainer(artefacts["hbv_rf"])
-    shap_values = explainer.shap_values(X)
-    # shap_values for binary RF is a list [neg, pos]; we want pos class
+    shap_values = explainer.shap_values(X_arr)
+
+    # shap_values may be a list [neg, pos] or a 3D array (n,F,2);
+    # extract the positive-class slice for our single sample.
     if isinstance(shap_values, list):
-        shap_vals = shap_values[1][0]  # positive class, first sample
+        shap_vals = shap_values[1][0]
         base = explainer.expected_value[1]
+    elif hasattr(shap_values, "ndim") and shap_values.ndim == 3:
+        shap_vals = shap_values[0, :, 1]
+        base = (
+            explainer.expected_value[1]
+            if isinstance(explainer.expected_value, (list, np.ndarray))
+            else explainer.expected_value
+        )
     else:
         shap_vals = shap_values[0]
         base = explainer.expected_value
 
+    # Feature names: prefer the captured feature_names_out, else fall back
+    feature_names = artefacts.get("feature_names_out") or list(range(len(shap_vals)))
+
     return {
         "hbv_prob": hbv_prob,
         "hcv_prob": hcv_prob,
-        "feature_names": list(row.columns),
-        "feature_values": X[0].tolist(),
+        "feature_names": list(feature_names),
+        "feature_values": X_arr[0].tolist(),
         "shap_values": shap_vals.tolist()
         if hasattr(shap_vals, "tolist")
         else list(shap_vals),
@@ -318,21 +350,25 @@ def predict_ultrasound_demo(image_bytes: bytes) -> dict:
 # ----------------------------------------------------------------------
 
 SAMPLE_TABULAR_RECORD = {
+    # demographics
     "age": 45,
     "sex": "M",
-    "alt": 78,
-    "ast": 65,
-    "alp": 110,
-    "platelets": 142,
-    "total_bilirubin": 1.4,
-    "direct_bilirubin": 0.5,
-    "albumin": 3.8,
+    "blood_group": "O+",
+    # numeric labs
     "haemoglobin": 13.2,
+    "rbs": 98,  # random blood sugar
+    "creatinine": 0.9,
+    "ast": 65,  # elevated
+    "alt": 78,  # elevated
+    "platelets": 142,  # low-normal
     "wbc": 6.8,
     "rbc": 4.7,
+    "alp": 110,
     "bun": 15,
-    "creatinine": 0.9,
-    "fasting_glucose": 98,
+    # binary serology (0 = negative, 1 = positive)
+    "hiv": 0,
+    "vdrl": 0,
+    "tpha": 0,
 }
 
 
@@ -358,56 +394,81 @@ def caveat_banner(status: ArtefactStatus) -> None:
 
 def render_tabular_form() -> dict | None:
     st.subheader("Tabular pathway — routine laboratory inputs")
+    st.caption(
+        "Fill in the patient's demographics, routine laboratory values, and "
+        "auxiliary serology results, or use the sample-record button. The "
+        "three derived features (AST/ALT ratio, APRI, FIB-4) are computed "
+        "automatically from the entered values."
+    )
 
     use_sample = st.button("Load sample patient record")
 
-    cols = st.columns(3)
-    record = {}
-
-    inputs = [
-        ("alt", "ALT (U/L)", 0.0, 1000.0, 30.0),
-        ("ast", "AST (U/L)", 0.0, 1000.0, 30.0),
-        ("alp", "ALP (U/L)", 0.0, 1000.0, 80.0),
-        ("platelets", "Platelets (×10⁹/L)", 10.0, 800.0, 250.0),
-        ("total_bilirubin", "Total bilirubin (mg/dL)", 0.0, 30.0, 1.0),
-        ("direct_bilirubin", "Direct bilirubin (mg/dL)", 0.0, 20.0, 0.3),
-        ("albumin", "Albumin (g/dL)", 1.0, 6.0, 4.0),
+    # Specification: each tuple is (key, label, min, max, default).
+    # Only user-entered numeric features appear here; ast_alt_ratio, apri, fib4
+    # are derived inside predict_tabular() and are not part of the form.
+    numeric_inputs = [
         ("haemoglobin", "Haemoglobin (g/dL)", 5.0, 20.0, 14.0),
+        ("rbs", "Random blood sugar (mg/dL)", 40.0, 500.0, 95.0),
+        ("creatinine", "Creatinine (mg/dL)", 0.2, 15.0, 0.9),
+        ("ast", "AST (U/L)", 0.0, 1000.0, 30.0),
+        ("alt", "ALT (U/L)", 0.0, 1000.0, 30.0),
+        ("platelets", "Platelets (×10⁹/L)", 10.0, 800.0, 250.0),
         ("wbc", "WBC (×10⁹/L)", 0.5, 30.0, 7.0),
         ("rbc", "RBC (×10¹²/L)", 2.0, 7.0, 4.8),
+        ("alp", "ALP (U/L)", 0.0, 1000.0, 80.0),
         ("bun", "BUN (mg/dL)", 2.0, 200.0, 14.0),
-        ("creatinine", "Creatinine (mg/dL)", 0.2, 15.0, 0.9),
-        ("fasting_glucose", "Fasting glucose (mg/dL)", 40.0, 500.0, 95.0),
     ]
-    # Per-field default map (used when no sample record is loaded)
-    field_defaults: dict[str, float | int | str] = {
-        key: default for key, _, _, _, default in inputs
-    }
-    field_defaults["age"] = 40
-    field_defaults["sex"] = "M"
+    field_defaults: dict = {key: default for key, _, _, _, default in numeric_inputs}
+    field_defaults.update(
+        {
+            "age": 40,
+            "sex": "M",
+            "blood_group": "O+",
+            "hiv": 0,
+            "vdrl": 0,
+            "tpha": 0,
+        }
+    )
 
     if use_sample:
         st.session_state["tabular_record"] = SAMPLE_TABULAR_RECORD.copy()
 
     defaults = st.session_state.get("tabular_record", field_defaults)
 
-    record["age"] = cols[0].number_input(
+    record: dict = {}
+
+    # --- Demographics row ---
+    st.markdown("**Demographics**")
+    dcols = st.columns(3)
+    record["age"] = dcols[0].number_input(
         "Age (years)",
         min_value=15,
         max_value=100,
         value=int(defaults.get("age", 40)),
         step=1,
     )
-    record["sex"] = cols[1].selectbox(
+    record["sex"] = dcols[1].selectbox(
         "Sex",
         options=["M", "F"],
         index=0 if defaults.get("sex", "M") == "M" else 1,
     )
+    bg_default = defaults.get("blood_group", "O+")
+    bg_index = (
+        BLOOD_GROUPS.index(bg_default)
+        if bg_default in BLOOD_GROUPS
+        else BLOOD_GROUPS.index("O+")
+    )
+    record["blood_group"] = dcols[2].selectbox(
+        "Blood group",
+        options=BLOOD_GROUPS,
+        index=bg_index,
+    )
 
-    for idx, (key, label, mn, mx, default) in enumerate(inputs):
-        col = cols[(idx + 2) % 3]
-        # Clamp the prefilled value into [mn, mx] in case a session-state
-        # value is out of range for the current field's bounds.
+    # --- Numeric labs ---
+    st.markdown("**Routine laboratory values**")
+    ncols = st.columns(3)
+    for idx, (key, label, mn, mx, default) in enumerate(numeric_inputs):
+        col = ncols[idx % 3]
         raw = float(defaults.get(key, default))
         clamped = min(max(raw, mn), mx)
         record[key] = col.number_input(
@@ -416,7 +477,28 @@ def render_tabular_form() -> dict | None:
             max_value=mx,
             value=clamped,
             step=0.1,
+            key=f"num_{key}",
         )
+
+    # --- Binary serology row ---
+    st.markdown("**Auxiliary serology (negative / positive)**")
+    bcols = st.columns(3)
+    for i, (key, label) in enumerate(
+        [
+            ("hiv", "HIV"),
+            ("vdrl", "VDRL"),
+            ("tpha", "TPHA"),
+        ]
+    ):
+        opt = bcols[i].selectbox(
+            label,
+            options=["Negative", "Positive"],
+            index=0 if int(defaults.get(key, 0)) == 0 else 1,
+            key=f"bin_{key}",
+        )
+        record[key] = 1 if opt == "Positive" else 0
+
+    st.markdown("---")
 
     if st.button("Run tabular pathway", type="primary"):
         return record
