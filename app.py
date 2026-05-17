@@ -364,26 +364,6 @@ def render_tabular_form() -> dict | None:
     cols = st.columns(3)
     record = {}
 
-    if use_sample:
-        st.session_state["tabular_record"] = SAMPLE_TABULAR_RECORD.copy()
-
-    defaults = st.session_state.get(
-        "tabular_record", {f: (35.0 if f != "age" else 40) for f in NUMERIC_FEATURES}
-    )
-
-    record["age"] = cols[0].number_input(
-        "Age (years)",
-        min_value=15,
-        max_value=100,
-        value=int(defaults.get("age", 40)),
-        step=1,
-    )
-    record["sex"] = cols[1].selectbox(
-        "Sex",
-        options=["M", "F"],
-        index=0 if defaults.get("sex", "M") == "M" else 1,
-    )
-
     inputs = [
         ("alt", "ALT (U/L)", 0.0, 1000.0, 30.0),
         ("ast", "AST (U/L)", 0.0, 1000.0, 30.0),
@@ -399,13 +379,42 @@ def render_tabular_form() -> dict | None:
         ("creatinine", "Creatinine (mg/dL)", 0.2, 15.0, 0.9),
         ("fasting_glucose", "Fasting glucose (mg/dL)", 40.0, 500.0, 95.0),
     ]
+    # Per-field default map (used when no sample record is loaded)
+    field_defaults: dict[str, float | int | str] = {
+        key: default for key, _, _, _, default in inputs
+    }
+    field_defaults["age"] = 40
+    field_defaults["sex"] = "M"
+
+    if use_sample:
+        st.session_state["tabular_record"] = SAMPLE_TABULAR_RECORD.copy()
+
+    defaults = st.session_state.get("tabular_record", field_defaults)
+
+    record["age"] = cols[0].number_input(
+        "Age (years)",
+        min_value=15,
+        max_value=100,
+        value=int(defaults.get("age", 40)),
+        step=1,
+    )
+    record["sex"] = cols[1].selectbox(
+        "Sex",
+        options=["M", "F"],
+        index=0 if defaults.get("sex", "M") == "M" else 1,
+    )
+
     for idx, (key, label, mn, mx, default) in enumerate(inputs):
         col = cols[(idx + 2) % 3]
+        # Clamp the prefilled value into [mn, mx] in case a session-state
+        # value is out of range for the current field's bounds.
+        raw = float(defaults.get(key, default))
+        clamped = min(max(raw, mn), mx)
         record[key] = col.number_input(
             label,
             min_value=mn,
             max_value=mx,
-            value=float(defaults.get(key, default)),
+            value=clamped,
             step=0.1,
         )
 
