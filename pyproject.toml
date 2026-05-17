@@ -5,10 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "grad-cam>=1.5.5",
     "imbalanced-learn==0.14.1",
     "joblib==1.5.3",
     "matplotlib>=3.10.9",
     "scikit-learn==1.6.1",
     "shap==0.51.0",
     "streamlit>=1.57.0",
+    "torch==2.10",
+    "torchvision==0.25",
 ]
