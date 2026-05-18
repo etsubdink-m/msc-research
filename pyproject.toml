@@ -9,6 +9,7 @@ dependencies = [
     "imbalanced-learn==0.14.1",
     "joblib==1.5.3",
     "matplotlib>=3.10.9",
+    "opencv-python-headless>=4.13.0.92",
     "scikit-learn==1.6.1",
     "shap==0.51.0",
     "streamlit>=1.57.0",
